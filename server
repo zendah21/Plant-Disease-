@@ -1,0 +1,151 @@
+import mysql.connector
+from flask import Flask, jsonify, request
+import cv2
+import numpy as np
+import base64
+import pickle
+import re
+
+app = Flask(__name__)
+
+# Load the trained model and scaler
+with open('random_forest_model.pkl', 'rb') as model_file:
+    model = pickle.load(model_file)
+
+with open('scaler.pkl', 'rb') as scaler_file:
+    scaler = pickle.load(scaler_file)
+
+# Connect to the MySQL database
+db_config = {
+    'host': 'localhost',
+    'user': 'admin',
+    'password': '1234',
+    'database': 'PlantDiseaseDB'
+}
+
+try:
+    connection = mysql.connector.connect(**db_config)
+    print("Connected to MySQL database")
+except mysql.connector.Error as e:
+    print("Error connecting to MySQL database:", e)
+
+cursor = connection.cursor()
+
+# Helper functions for LBP and preprocessing
+def calculate_lbp_features(image):
+    lbp_image = np.zeros_like(image)
+    for i in range(1, image.shape[0] - 1):
+        for j in range(1, image.shape[1] - 1):
+            center = image[i, j]
+            code = 0
+            code |= (image[i - 1, j - 1] > center) << 7
+            code |= (image[i - 1, j] > center) << 6
+            code |= (image[i - 1, j + 1] > center) << 5
+            code |= (image[i, j + 1] > center) << 4
+            code |= (image[i + 1, j + 1] > center) << 3
+            code |= (image[i + 1, j] > center) << 2
+            code |= (image[i + 1, j - 1] > center) << 1
+            code |= (image[i, j - 1] > center) << 0
+            lbp_image[i, j] = code
+    hist, _ = np.histogram(lbp_image.ravel(), bins=np.arange(0, 256), range=(0, 255))
+    hist = hist.astype("float")
+    hist /= (hist.sum() + 1e-6)
+    return hist
+
+def preprocess_and_extract_features(image_data):
+    try:
+        # Decode the base64 string to bytes
+        image_bytes = base64.b64decode(image_data)
+        # Convert the bytes to a numpy array
+        image_np = np.frombuffer(image_bytes, dtype=np.uint8)
+        # Decode the image using OpenCV
+        image = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
+        gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray_image = cv2.resize(gray_image, (128, 128))
+        lbp_features = calculate_lbp_features(gray_image)
+        return lbp_features
+    except Exception as e:
+        print("Error preprocessing image:", e)
+        return None
+
+def predict_disease(image_data):
+    try:
+        features = preprocess_and_extract_features(image_data)
+        if features is not None:
+            normalized_features = scaler.transform(np.array([features]))
+            return model.predict(normalized_features)[0]
+        else:
+            return None
+    except Exception as e:
+        print("Error predicting disease:", e)
+        return None
+
+def table_exists(table_name):
+    try:
+        cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+        result = cursor.fetchone()
+        return bool(result)
+    except Exception as e:
+        print(f"Error checking if table exists: {e}")
+        return False
+
+def capitalize_start_letters(word):
+    return ' '.join(w.capitalize() for w in word.split())
+
+def remove_special_characters(text):
+    return re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
+
+def get_plant_and_disease(prediction):
+    parts = prediction.split('___')
+    if len(parts) == 2:
+        plant_name, disease_name = parts
+        plant_name = remove_special_characters(plant_name)
+        disease_name = remove_special_characters(disease_name)
+        disease_name = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', disease_name)
+        disease_name = disease_name.replace('_', ' ')
+        disease_name = capitalize_start_letters(disease_name)
+        return plant_name.strip(), disease_name.strip()
+    else:
+        return prediction, ""
+
+def get_disease_info(plant_name, disease_name):
+    try:
+        if table_exists(plant_name + 'Diseases'):
+            query = "SELECT SymptomDescription, TreatmentDescription FROM " + plant_name + "Diseases WHERE DiseaseName = %s"
+            cursor.execute(query, (disease_name,))
+            result = cursor.fetchone()
+            if result:
+                symptoms, treatment = result
+                return {'disease_name': disease_name, 'plant_name': plant_name, 'symptoms': symptoms, 'treatment': treatment}
+            else:
+                return {'error': f'Disease name {disease_name} not found for {plant_name}'}
+        else:
+            return {'error': f'No diseases found for {plant_name}'}
+    except Exception as e:
+        print(f"Error retrieving disease information: {e}")
+        return {'error': str(e)}
+
+@app.route('/')
+@app.route('/get_disease_info', methods=['POST'])
+def get_disease_information():
+    try:
+        json_data = request.get_json()
+        base64_image = json_data.get('image', '')
+        prediction = predict_disease(base64_image)
+        if prediction is not None:
+            plant_name, disease_name = get_plant_and_disease(prediction)
+            if 'healthy' in prediction:
+                return jsonify({'plant_name': plant_name})
+            disease_info = get_disease_info(plant_name, disease_name)
+            if 'error' in disease_info:
+                return jsonify({'error': disease_info['error']})
+            else:
+                return jsonify({'result': disease_info})
+        else:
+            return jsonify({'error': 'Error during prediction'})
+    except Exception as e:
+        print(f"Error processing request: {e}")
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
